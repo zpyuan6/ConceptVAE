@@ -1,11 +1,12 @@
 import torch
+import numpy as np
 from torch import nn
 from torch.nn import functional as F
 from typing import List
 from torch import Tensor
-import numpy as np
 
-class ConceptVAE(nn.Module):
+
+class CategoricalVAE(nn.Module):
 
     def __init__(self,
                  in_channels: int,
@@ -17,6 +18,7 @@ class ConceptVAE(nn.Module):
                  anneal_interval: int = 100, # every 100 batches
                  alpha: float = 30.,
                  **kwargs) -> None:
+        super(CategoricalVAE, self).__init__()
 
         self.latent_dim = latent_dim
         self.categorical_dim = categorical_dim
