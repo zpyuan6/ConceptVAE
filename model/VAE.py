@@ -5,66 +5,80 @@ from typing import List
 from torch import Tensor
 import numpy as np
 
-class ConceptVAE(nn.Module):
+
+class VAE(nn.Module):
 
     def __init__(self,
                  in_channels: int,
                  input_size:int,
                  latent_dim: int,
-                 concept_dims: List = None,
                  hidden_dims: List = None,
                  **kwargs) -> None:
-        super(ConceptVAE, self).__init__()
+        super(VAE, self).__init__()
 
         self.latent_dim = latent_dim
 
         modules = []
         if hidden_dims is None:
-            self.hidden_dims = [4096, 2048, 1024]
+            self.hidden_dims = [8, 32, 128, 256, 512]
         else:
             self.hidden_dims = hidden_dims
 
         self.input_size = input_size
-        self.in_channels = in_channels
-        input_shape = self.in_channels * self.input_size * self.input_size
+        self.feature_map_size = input_size
         # Build Encoder
+        self.in_channels = in_channels
         for h_dim in self.hidden_dims:
             modules.append(
                 nn.Sequential(
-                    nn.Linear(input_shape, h_dim),
-                    nn.BatchNorm1d(h_dim),
+                    nn.Conv2d(in_channels, out_channels=h_dim,
+                              kernel_size= 3, stride= 2, padding  = 1),
+                    nn.BatchNorm2d(h_dim),
                     nn.LeakyReLU())
             )
-            input_shape = h_dim
+            in_channels = h_dim
+            self.feature_map_size = int(np.floor((self.feature_map_size + 2*1 - 3)/2) + 1)
 
         self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(self.hidden_dims[-1], latent_dim)
-        self.fc_var = nn.Linear(self.hidden_dims[-1], latent_dim)
+        self.fc_mu = nn.Linear(self.hidden_dims[-1]*self.feature_map_size*self.feature_map_size, latent_dim)
+        self.fc_var = nn.Linear(self.hidden_dims[-1]*self.feature_map_size*self.feature_map_size, latent_dim)
 
 
         # Build Decoder
         modules = []
 
-        self.decoder_input = nn.Linear(latent_dim, self.hidden_dims[-1])
+        self.decoder_input = nn.Linear(latent_dim, self.hidden_dims[-1] *self.feature_map_size*self.feature_map_size)
 
         reversed_hidden_dims = self.hidden_dims[::-1]
 
         for i in range(len(reversed_hidden_dims) - 1):
             modules.append(
                 nn.Sequential(
-                    nn.Linear(reversed_hidden_dims[i],reversed_hidden_dims[i + 1]),
-                    nn.BatchNorm1d(reversed_hidden_dims[i + 1]),
-                    nn.LeakyReLU()
-                    )
+                    nn.ConvTranspose2d(reversed_hidden_dims[i],
+                                       reversed_hidden_dims[i + 1],
+                                       kernel_size=3,
+                                       stride = 2,
+                                       padding=1,
+                                       output_padding=1),
+                    nn.BatchNorm2d(reversed_hidden_dims[i + 1]),
+                    nn.LeakyReLU())
             )
+
+
 
         self.decoder = nn.Sequential(*modules)
 
         self.final_layer = nn.Sequential(
-                            nn.Linear(reversed_hidden_dims[-1], reversed_hidden_dims[-1]),
-                            nn.BatchNorm1d(reversed_hidden_dims[-1]),
+                            nn.ConvTranspose2d(reversed_hidden_dims[-1],
+                                               reversed_hidden_dims[-1],
+                                               kernel_size=3,
+                                               stride=2,
+                                               padding=1,
+                                               output_padding=1),
+                            nn.BatchNorm2d(reversed_hidden_dims[-1]),
                             nn.LeakyReLU(),
-                            nn.Linear(reversed_hidden_dims[-1], self.in_channels * self.input_size * self.input_size),
+                            nn.Conv2d(reversed_hidden_dims[-1], out_channels= self.in_channels,
+                                      kernel_size= 3, padding= 1),
                             nn.Tanh())
 
     def encode(self, input: Tensor) -> List[Tensor]:
@@ -74,7 +88,6 @@ class ConceptVAE(nn.Module):
         :param input: (Tensor) Input tensor to encoder [N x C x H x W]
         :return: (Tensor) List of latent codes
         """
-        input = input.view(input.size(0), -1)
         result = self.encoder(input)
         result = torch.flatten(result, start_dim=1)
 
@@ -93,9 +106,9 @@ class ConceptVAE(nn.Module):
         :return: (Tensor) [B x C x H x W]
         """
         result = self.decoder_input(z)
+        result = result.view(-1, self.hidden_dims[-1], self.feature_map_size, self.feature_map_size)
         result = self.decoder(result)
         result = self.final_layer(result)
-        result = result.view(-1, self.in_channels, self.input_size, self.input_size)
         return result
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
@@ -132,6 +145,7 @@ class ConceptVAE(nn.Module):
 
         kld_weight = kwargs['M_N'] # Account for the minibatch samples from the dataset
         recons_loss =F.mse_loss(recons, input)
+
 
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
@@ -172,5 +186,6 @@ class ConceptVAE(nn.Module):
             'in_channels': self.in_channels,
             'input_size': self.input_size,
             'latent_dim': self.latent_dim,
-            'hidden_dims': self.hidden_dims
+            'hidden_dims': self.hidden_dims,
+            'feature_map_size': self.feature_map_size
         }

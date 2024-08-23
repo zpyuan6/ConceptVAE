@@ -30,8 +30,8 @@ class PVRDataset(Dataset):
 
         self.x = torch.from_numpy(np.array(x))
 
-        if self.x.shape[1] != 3:
-            self.x = self.x.repeat(1,3,1,1)
+        # if self.x.shape[1] != 3:
+        #     self.x = self.x.repeat(1,3,1,1)
 
         if torch.max(self.x) > 1:
             self.x = self.x / 255

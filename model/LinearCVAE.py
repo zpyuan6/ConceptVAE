@@ -5,16 +5,16 @@ from typing import List
 from torch import Tensor
 import numpy as np
 
-class ConceptVAE(nn.Module):
+
+class LinearVAE(nn.Module):
 
     def __init__(self,
                  in_channels: int,
                  input_size:int,
                  latent_dim: int,
-                 concept_dims: List = None,
                  hidden_dims: List = None,
                  **kwargs) -> None:
-        super(ConceptVAE, self).__init__()
+        super(LinearVAE, self).__init__()
 
         self.latent_dim = latent_dim
 
@@ -33,7 +33,7 @@ class ConceptVAE(nn.Module):
                 nn.Sequential(
                     nn.Linear(input_shape, h_dim),
                     nn.BatchNorm1d(h_dim),
-                    nn.LeakyReLU())
+                    nn.ReLU())
             )
             input_shape = h_dim
 
@@ -54,7 +54,7 @@ class ConceptVAE(nn.Module):
                 nn.Sequential(
                     nn.Linear(reversed_hidden_dims[i],reversed_hidden_dims[i + 1]),
                     nn.BatchNorm1d(reversed_hidden_dims[i + 1]),
-                    nn.LeakyReLU()
+                    nn.ReLU()
                     )
             )
 
@@ -63,9 +63,9 @@ class ConceptVAE(nn.Module):
         self.final_layer = nn.Sequential(
                             nn.Linear(reversed_hidden_dims[-1], reversed_hidden_dims[-1]),
                             nn.BatchNorm1d(reversed_hidden_dims[-1]),
-                            nn.LeakyReLU(),
+                            nn.ReLU(),
                             nn.Linear(reversed_hidden_dims[-1], self.in_channels * self.input_size * self.input_size),
-                            nn.Tanh())
+                            nn.Sigmoid())
 
     def encode(self, input: Tensor) -> List[Tensor]:
         """
@@ -74,7 +74,7 @@ class ConceptVAE(nn.Module):
         :param input: (Tensor) Input tensor to encoder [N x C x H x W]
         :return: (Tensor) List of latent codes
         """
-        input = input.view(input.size(0), -1)
+        input = input.view(input.shape[0], -1)
         result = self.encoder(input)
         result = torch.flatten(result, start_dim=1)
 
@@ -131,7 +131,8 @@ class ConceptVAE(nn.Module):
         log_var = args[3]
 
         kld_weight = kwargs['M_N'] # Account for the minibatch samples from the dataset
-        recons_loss =F.mse_loss(recons, input)
+        recons_loss =F.mse_loss(recons, input, reduction='sum') / input.shape[0]
+        # print(f"Loss: {recons_loss}, Loss shape: {recons_loss.shape}, Loss: {F.mse_loss(recons, input)}, Loss: {F.mse_loss(recons, input, reduction='sum')}")
 
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
