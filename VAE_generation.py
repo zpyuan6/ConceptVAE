@@ -87,25 +87,61 @@ def load_model_from_training_folder(path):
             latent_dim=hyperparameters['model_params']['latent_dim'],
             hidden_dims=hyperparameters['model_params']['hidden_dims']
         )
+    elif hyperparameters['model'] == 'VAE':
+        model = VAE(
+            in_channels=hyperparameters['model_params']['in_channels'],
+            input_size=hyperparameters['model_params']['input_size'],
+            latent_dim=hyperparameters['model_params']['latent_dim'],
+            hidden_dims=hyperparameters['model_params']['hidden_dims']
+        )
+    elif hyperparameters['model'] == 'ConceptVAE':
+        model = ConceptVAE(
+            in_channels=hyperparameters['model_params']['in_channels'],
+            input_size=hyperparameters['model_params']['input_size'],
+            latent_dim=hyperparameters['model_params']['latent_dim'],
+            concept_dims=hyperparameters['model_params']['concept_dims'],
+            hidden_dims=hyperparameters['model_params']['hidden_dims']
+        )
 
-    # model.load_state_dict(torch.load(os.path.join(path, f"{hyperparameters['model']}_best.pth")))
-
-    model.load_state_dict(torch.load(os.path.join(path, "LinearVAE_val_loss_34.177555338541666_matric_-0.20804938970133663.pth")))
-
-    for name, param in model.named_parameters():
-        print(name)
-        print(param)
-        break
+    model.load_state_dict(torch.load(os.path.join(path, f"{hyperparameters['model']}_best.pth")))
 
     return model
     
     
+def conditional_generation(model:nn.Module):
+    num_samples = 3
+    z = torch.randn(num_samples, model.latent_dim)
+
+    concept_features = []
+
+    construct_title = [[] for i in range(num_samples)]
+    for concept_dim in model.concept_dims:
+        random_concept_list = torch.randint(0, concept_dim, (num_samples,))
+        concept_features.append(torch.nn.functional.one_hot(random_concept_list, num_classes=concept_dim))
+        for i in range(num_samples):
+            construct_title[i].append(random_concept_list[i].item())
+
+    model=model.eval()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    output = model.sample(z, concept_features, current_device=device)
+
+    fig, ax = plt.subplots(1, num_samples)
+    for i in range(num_samples):
+        ax[i].imshow(output[i].permute(1, 2, 0).cpu().detach().numpy())
+        ax[i].set_title(f"{construct_title[i]}")
+
+    plt.show()
+
 
 if __name__ == "__main__":
 
-    model_save_path = "model_save_path\\2024-08-23-16-18-01"
+    model_save_path = "model_save_path\\2024-08-26-15-15-12"
     
     model = load_model_from_training_folder(model_save_path)
 
     # generation_from_latent(model)
     # generation_examples(model)
+
+    conditional_generation(model)

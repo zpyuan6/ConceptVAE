@@ -10,30 +10,34 @@ class CategoricalVAE(nn.Module):
 
     def __init__(self,
                  in_channels: int,
+                 input_size: int,
                  latent_dim: int,
                  categorical_dim: int = 40, # Num classes
                  hidden_dims: List = None,
-                 temperature: float = 0.5,
+                 temperature: float = 1,
                  anneal_rate: float = 3e-5,
                  anneal_interval: int = 100, # every 100 batches
-                 alpha: float = 30.,
                  **kwargs) -> None:
         super(CategoricalVAE, self).__init__()
 
         self.latent_dim = latent_dim
         self.categorical_dim = categorical_dim
         self.temp = temperature
-        self.min_temp = temperature
+        self.min_temp = temperature/2
         self.anneal_rate = anneal_rate
         self.anneal_interval = anneal_interval
-        self.alpha = alpha
 
         modules = []
         if hidden_dims is None:
-            hidden_dims = [32, 64, 128, 256, 512]
+            self.hidden_dims = [32, 64, 128, 256, 512]
+        else:
+            self.hidden_dims = hidden_dims
 
+        self.input_size = input_size
+        self.feature_map_size = input_size
+        self.in_channels = in_channels
         # Build Encoder
-        for h_dim in hidden_dims:
+        for h_dim in self.hidden_dims:
             modules.append(
                 nn.Sequential(
                     nn.Conv2d(in_channels, out_channels=h_dim,
@@ -42,29 +46,29 @@ class CategoricalVAE(nn.Module):
                     nn.LeakyReLU())
             )
             in_channels = h_dim
+            self.feature_map_size = int(np.floor((self.feature_map_size + 2*1 - 3)/2) + 1)
 
         self.encoder = nn.Sequential(*modules)
-        self.fc_z = nn.Linear(hidden_dims[-1]*4,
+        self.fc_z = nn.Linear(hidden_dims[-1]*self.feature_map_size*self.feature_map_size,
                                self.latent_dim * self.categorical_dim)
 
         # Build Decoder
         modules = []
 
-        self.decoder_input = nn.Linear(self.latent_dim * self.categorical_dim
-                                       , hidden_dims[-1] * 4)
+        self.decoder_input = nn.Linear(self.latent_dim * self.categorical_dim, hidden_dims[-1]*self.feature_map_size*self.feature_map_size)
 
-        hidden_dims.reverse()
+        reversed_hidden_dims = self.hidden_dims[::-1]
 
-        for i in range(len(hidden_dims) - 1):
+        for i in range(len(reversed_hidden_dims) - 1):
             modules.append(
                 nn.Sequential(
-                    nn.ConvTranspose2d(hidden_dims[i],
-                                       hidden_dims[i + 1],
+                    nn.ConvTranspose2d(reversed_hidden_dims[i],
+                                       reversed_hidden_dims[i + 1],
                                        kernel_size=3,
                                        stride = 2,
                                        padding=1,
                                        output_padding=1),
-                    nn.BatchNorm2d(hidden_dims[i + 1]),
+                    nn.BatchNorm2d(reversed_hidden_dims[i + 1]),
                     nn.LeakyReLU())
             )
 
@@ -73,15 +77,15 @@ class CategoricalVAE(nn.Module):
         self.decoder = nn.Sequential(*modules)
 
         self.final_layer = nn.Sequential(
-                            nn.ConvTranspose2d(hidden_dims[-1],
-                                               hidden_dims[-1],
+                            nn.ConvTranspose2d(reversed_hidden_dims[-1],
+                                               reversed_hidden_dims[-1],
                                                kernel_size=3,
                                                stride=2,
                                                padding=1,
                                                output_padding=1),
-                            nn.BatchNorm2d(hidden_dims[-1]),
+                            nn.BatchNorm2d(reversed_hidden_dims[-1]),
                             nn.LeakyReLU(),
-                            nn.Conv2d(hidden_dims[-1], out_channels= in_channels,
+                            nn.Conv2d(reversed_hidden_dims[-1], out_channels= self.in_channels,
                                       kernel_size= 3, padding= 1),
                             nn.Tanh())
         self.sampling_dist = torch.distributions.OneHotCategorical(1. / categorical_dim * torch.ones((self.categorical_dim, 1)))
@@ -110,7 +114,7 @@ class CategoricalVAE(nn.Module):
         :return: (Tensor) [B x C x H x W]
         """
         result = self.decoder_input(z)
-        result = result.view(-1, 512, 2, 2)
+        result = result.view(-1, self.hidden_dims[-1], self.feature_map_size, self.feature_map_size)
         result = self.decoder(result)
         result = self.final_layer(result)
         return result
@@ -129,7 +133,6 @@ class CategoricalVAE(nn.Module):
         s = F.softmax((z + g) / self.temp, dim=-1)
         s = s.view(-1, self.latent_dim * self.categorical_dim)
         return s
-
 
     def forward(self, input: Tensor, **kwargs) -> List[Tensor]:
         q = self.encode(input)[0]
@@ -157,10 +160,9 @@ class CategoricalVAE(nn.Module):
 
         # Anneal the temperature at regular intervals
         if batch_idx % self.anneal_interval == 0 and self.training:
-            self.temp = np.maximum(self.temp * np.exp(- self.anneal_rate * batch_idx),
-                                   self.min_temp)
+            self.temp = np.maximum(self.temp * np.exp(- self.anneal_rate * batch_idx), self.min_temp)
 
-        recons_loss =F.mse_loss(recons, input, reduction='mean')
+        recons_loss =F.mse_loss(recons, input, reduction='sum') / input.shape[0]
 
         # KL divergence between gumbel-softmax distribution
         eps = 1e-7
@@ -173,7 +175,7 @@ class CategoricalVAE(nn.Module):
         kld_loss = torch.mean(torch.sum(h1 - h2, dim =(1,2)), dim=0)
 
         # kld_weight = 1.2
-        loss = self.alpha * recons_loss + kld_weight * kld_loss
+        loss = recons_loss + kld_weight * kld_loss
         return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
 
     def sample(self,
@@ -207,3 +209,14 @@ class CategoricalVAE(nn.Module):
         """
 
         return self.forward(x)[0]
+
+    def get_hyperparamters(self):
+
+        return {
+            'in_channels': self.in_channels,
+            'input_size': self.input_size,
+            'latent_dim': self.latent_dim,
+            'categorical_dim': self.categorical_dim,
+            'hidden_dims': self.hidden_dims,
+            'feature_map_size': self.feature_map_size
+        }

@@ -216,6 +216,220 @@ class Trainer():
         return self.model
 
         
+class SupervisedTrainer():
+    def __init__(
+        self,
+        model:nn.Module,
+        training_dataset: data.Dataset,
+        batch_size: int,
+        learning_rate: float,
+        num_epochs: int,
+        num_workers: int,
+        train_val_split: float = 0.9,
+        model_save_path: str = f'model_save_path/{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}'
+        ):
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.model = model
+
+        self.batch_size = batch_size
+        train_idx, val_idx = train_test_split(list(range(training_dataset.__len__())), train_size=train_val_split, shuffle=True)
+        data_train = data.Subset(training_dataset, train_idx)
+        data_val = data.Subset(training_dataset, val_idx)
+        self.train_dataloader = data.DataLoader(data_train, shuffle=True, batch_size=batch_size, num_workers=num_workers, pin_memory = True, prefetch_factor=batch_size*2)
+        self.val_dataloader = data.DataLoader(data_val, shuffle=False, batch_size=batch_size, num_workers=num_workers, pin_memory = True, prefetch_factor=batch_size*2)
+
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.1)
+
+        patience = 5
+        self.model_save_path = model_save_path
+        self.early_stopping = EarlyStopping(patience=patience, path=model_save_path, model_name = model.__class__.__name__)
+
+        self.num_epochs = num_epochs
+
+        parameter_dict = {
+            "dataset": training_dataset.__class__.__name__,
+            "model": model.__class__.__name__,
+            "model_params": model.get_hyperparamters(),
+            "trainer_params": {
+                "batch_size": self.batch_size,
+                "learning_rate": learning_rate,
+                "num_epochs": self.num_epochs,
+                "num_workers": num_workers,
+                "early_stopping_patience": patience
+            }
+        }
+
+        if not os.path.exists(model_save_path):
+            os.makedirs(model_save_path)
+
+        with open(os.path.join(model_save_path, "training_parameters.yaml"), "w") as f:
+            yaml.dump(parameter_dict, f)
+
+    def train(self, save_samples: bool = False):
+        self.model = self.model.to(self.device)
+        
+        for epoch in range(self.num_epochs):
+
+            self.model.train()
+            train_loss = 0
+            train_reconstruct_loss=0
+            train_kld_loss=0
+            train_distance = 0
+            train_classify_loss = 0
+            train_classify_acc_items = 0
+            train_concept_total_num = 0
+            with tqdm(total=len(self.train_dataloader), postfix={'epoch': epoch}) as train_bar:
+                for batch_idx, (x, y) in enumerate(self.train_dataloader):
+                    x = x.to(self.device)
+                    concept_label = y.to(self.device)
+                    self.optimizer.zero_grad()
+                    output = self.model(x)
+                    classify = [torch.argmax(nn.functional.softmax(o, dim=1),1) for o in output[4]]
+                    classify_results = torch.stack(classify, dim=0).transpose(0, 1)
+                    train_classify_acc_items += (classify_results == concept_label).sum().item()
+                    train_concept_total_num += np.prod(concept_label.shape)
+                    loss = self.model.loss_function(*output, concept_label, M_N=0.5, batch_idx=batch_idx)
+                    loss['loss'].backward()
+                    self.optimizer.step()
+                    train_loss += loss['loss'].item()
+                    train_reconstruct_loss += loss['Reconstruction_Loss'].item()
+                    train_kld_loss += loss['KLD'].item()
+                    train_distance += torch.mean(torch.abs(x - output[0])).item()
+                    train_classify_loss += loss['Classify_Loss'].item()
+                    train_bar.update(1)
+
+            self.scheduler.step()
+            train_loss /= self.train_dataloader.dataset.__len__()
+            train_reconstruct_loss /= self.train_dataloader.dataset.__len__()
+            train_kld_loss /= self.train_dataloader.dataset.__len__()
+            train_classify_loss /= self.train_dataloader.dataset.__len__()
+            train_distance /= -self.train_dataloader.dataset.__len__()
+            train_distance *= 255
+            train_bar.set_description(f'avg_train_loss: {train_loss}; avg_train_dist: {train_distance} epoch: {epoch}')
+
+            self.model.eval()
+            val_loss = 0
+            val_reconstruct_loss=0
+            val_kld_loss=0
+            val_distance = 0
+            val_classify_loss = 0
+            val_classify_acc_items = 0
+            val_total_num = 0
+            with tqdm(total=len(self.val_dataloader)) as val_bar:
+                for batch_idx, (x, y) in enumerate(self.val_dataloader):
+                    x = x.to(self.device)
+                    concept_label = y.to(self.device)
+                    output = self.model(x)
+                    classify = [torch.argmax(nn.functional.softmax(o, dim=1),1) for o in output[4]]
+                    classify_results = torch.stack(classify, dim=0).transpose(0, 1)
+                    val_classify_acc_items += (classify_results == concept_label).sum().item()
+                    val_total_num += np.prod(concept_label.shape)
+                    loss = self.model.loss_function(*output, concept_label, batch_idx=batch_idx)
+                    val_loss += loss['loss'].item()
+                    val_reconstruct_loss += loss['Reconstruction_Loss'].item()
+                    val_kld_loss += loss['KLD'].item()
+                    val_distance += torch.mean(torch.abs(x - output[0])).item()
+                    val_classify_loss += loss['Classify_Loss'].item()
+                    val_bar.update(1)
+
+                    if save_samples and batch_idx == 0:
+                        save_path = os.path.join(self.early_stopping.path, "images")
+                        os.makedirs(save_path, exist_ok=True)
+                        plot_generation_with_input(
+                            x[:3],
+                            output[0][:3],
+                            save_path=os.path.join(save_path, f"epoch_{epoch}.png")
+                        )
+
+            val_loss /= self.val_dataloader.dataset.__len__()
+            val_reconstruct_loss /= self.val_dataloader.dataset.__len__()
+            val_kld_loss /= self.val_dataloader.dataset.__len__()
+            val_classify_loss /= self.val_dataloader.dataset.__len__()
+            val_distance /= -self.val_dataloader.dataset.__len__()
+            val_distance *= 255
+            val_bar.set_description(f'avg_val_loss: {val_loss}; avg_val_dist: {val_distance}; epoch: {epoch}.')
+            wandb.log({
+                    'train_loss': train_loss, 
+                    'train_reconstruction_Loss':train_reconstruct_loss,
+                    'train_KLD':train_kld_loss,
+                    'train_dist':train_distance, 
+                    'train_classify_loss': train_classify_loss,
+                    'train_acc': train_classify_acc_items/train_concept_total_num,
+                    'val_loss': val_loss,
+                    'val_reconstruction_Loss':val_reconstruct_loss,
+                    'val_KLD':val_kld_loss, 
+                    'val_dist':val_distance,
+                    'val_classify_loss': val_classify_loss,
+                    'val_acc': val_classify_acc_items/val_total_num,
+                    'epoch': epoch
+                    })
+
+            self.scheduler.step()
+            
+            self.early_stopping(val_loss, val_distance, self.model, train_loss)
+
+            if self.early_stopping.early_stop:
+                print("Early stopping")
+                break
+
+        return self.model
+
+
+class SupervisedEvaluator():
+    def __init__(
+        self,
+        model:nn.Module,
+        testing_dataset: data.Dataset,
+        batch_size: int,
+        num_workers: int,
+        ):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = model
+        self.test_dataloader = data.DataLoader(testing_dataset, shuffle=False, batch_size=batch_size, num_workers=num_workers, pin_memory = True, prefetch_factor=batch_size*2)
+
+    def evaluate(self):
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        test_loss=0
+        reconstruct_loss=0
+        kld_loss=0
+        test_distance=0
+        classify_loss = 0
+        classify_acc_items = 0
+        total_num = 0
+        with tqdm(total=len(self.test_dataloader)) as test_bar:
+            for batch_idx, (x, y) in enumerate(self.test_dataloader):
+                    x = x.to(self.device)
+                    concept_label = y.to(self.device)
+                    output = self.model(x)
+                    loss = self.model.loss_function(*output, concept_label, batch_idx=batch_idx)
+                    classify = [torch.argmax(nn.functional.softmax(o, dim=1),1) for o in output[4]]
+                    classify_results = torch.stack(classify, dim=0).transpose(0, 1)
+                    classify_acc_items += (classify_results == concept_label).sum().item()
+                    total_num += np.prod(concept_label.shape)
+                    test_loss += loss['loss'].item()
+                    reconstruct_loss += loss['Reconstruction_Loss'].item()
+                    kld_loss += loss['KLD'].item()
+                    test_distance += torch.mean(torch.abs(x - output[0])).item()
+                    classify_loss += loss['Classify_Loss'].item()
+                    test_bar.update(1)
+
+            test_loss /= self.test_dataloader.dataset.__len__()
+            reconstruct_loss /= self.test_dataloader.dataset.__len__()
+            kld_loss /= self.test_dataloader.dataset.__len__()
+            test_distance /= -self.test_dataloader.dataset.__len__() 
+            test_distance *= 255
+            test_bar.set_description(f'test_loss: {test_loss}; test_dist: {test_distance}.')
+            wandb.log({
+                    'test_loss': test_loss, 
+                    'Reconstruction_Loss':reconstruct_loss, 
+                    'KLD':kld_loss,
+                    'test_distance': test_distance
+                    })
 
 
 class Evaluator():

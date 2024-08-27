@@ -5,7 +5,7 @@ from typing import List
 from torch import Tensor
 import numpy as np
 
-class ConceptVAE(nn.Module):
+class CausalConceptVAE(nn.Module):
 
     def __init__(self,
                  in_channels: int,
@@ -16,7 +16,7 @@ class ConceptVAE(nn.Module):
                  kld_weight: int = 1,
                  classify_weight: int = 1,
                  **kwargs) -> None:
-        super(ConceptVAE, self).__init__()
+        super(CausalConceptVAE, self).__init__()
 
         self.latent_dim = latent_dim
         self.concept_dims = concept_dims
@@ -238,6 +238,57 @@ class ConceptVAE(nn.Module):
         """
 
         return self.forward(x)[0]
+
+    def get_causal_adjacency_matrix(self, norm:str='mean'):
+        weights = []
+        
+        weights.append(self.decoder_input.weight)
+
+        for name, params in self.decoder.named_parameters():
+            if 'weight' in name:
+                print(params.shape)
+                weights.append(params)
+        for name, params in self.final_layer.named_parameters():
+            if 'weight' in name:
+                print(params.shape)
+                weights.append(params)
+
+        adjacency_matrix = torch.eye(sum(self.concept_dims))
+
+        for i in range(len(weights)-1):
+            if i == 0:
+                w1 = weights[i][:, self.latent_dim:].transpose(0,1)
+                w1 = w1.view(w1.shape[0], -1, self.feature_map_size, self.feature_map_size)
+                w1 = nn.AvgPool2d(w1.shape[-1])(w1)
+                w1 = torch.abs(w1).squeeze()
+
+            w2 =  weights[i+1]
+            if len(w2.shape) > 2:
+                w2 = nn.AvgPool2d(w2.shape[-1])(w2)
+                w2 = torch.abs(w2)
+            
+                if i != len(weights)-2:
+                    w2 = w2.squeeze()
+                else:
+                    w2 = w2.squeeze(dim=-1)
+                    w2 = w2.squeeze(dim=-1)
+                    w2 = w2.transpose(0,1)
+
+            if len(w1.shape) == len(w2.shape):
+                w1 = w1 @ w2
+            else:
+                w1 = w1 * w2
+
+        w1 = w1.squeeze()
+        w1 = nn.Softmax()(w1)
+        print(w1)
+
+    def h_loss(self, adjacency_matrix: Tensor):
+        return torch.trace(torch.matrix_exp(adjacency_matrix)) - adjacency_matrix.shape[0]
+
+    def aug_lagrangian_loss(self, adjacency_matrix: Tensor, h: Tensor):
+        # construction_loss + 0.5 * mu * h_loss ** 2 + lamb * h_loss + KL_loss
+        raise NotImplementedError
 
     def get_hyperparamters(self):
 
