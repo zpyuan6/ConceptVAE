@@ -4,15 +4,15 @@ from torch.nn import functional as F
 from typing import List
 from torch import Tensor
 import numpy as np
+from tqdm import tqdm
 
 class CausalConceptVAE(nn.Module):
 
     def __init__(self,
                  in_channels: int,
-                 input_size:int,
+                 input_shape:list,
                  latent_dim: int = 10,
                  concept_dims: list = [10,10,10,10],
-                 hidden_dims: List = None,
                  kld_weight: int = 1,
                  classify_weight: int = 1,
                  **kwargs) -> None:
@@ -22,107 +22,57 @@ class CausalConceptVAE(nn.Module):
         self.concept_dims = concept_dims
         self.kld_weight = kld_weight
 
-        modules = []
-        if hidden_dims is None:
-            self.hidden_dims = [8, 32, 128, 256, 512]
-        else:
-            self.hidden_dims = hidden_dims
-
-        self.input_size = input_size
+        # input_shape = [neuronal abstraction width, number of layers]
+        self.input_shape = input_shape
         self.in_channels = in_channels
-        self.feature_map_size = input_size
 
         self.classify_weight = classify_weight
-        
+        num_concepts = len(self.concept_dims)
+
         # Build Encoder
-        for h_dim in self.hidden_dims:
-            modules.append(
-                nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels=h_dim,
-                              kernel_size= 3, stride= 2, padding  = 1),
-                    nn.BatchNorm2d(h_dim),
-                    nn.LeakyReLU())
-            )
-            
-            in_channels = h_dim
-            self.feature_map_size = int(np.floor((self.feature_map_size + 2*1 - 3)/2) + 1)
-
-        self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(self.hidden_dims[-1]*self.feature_map_size*self.feature_map_size, self.latent_dim)
-        self.fc_var = nn.Linear(self.hidden_dims[-1]*self.feature_map_size*self.feature_map_size, self.latent_dim)
-
-        self.concept_classifiers = []
-        self.concept_linears = []
-
-        for i in range(len(self.concept_dims)):
-            classifier_module = []
-            classifier_module.append(
-                    nn.Sequential(
-                        nn.Conv2d(self.in_channels, out_channels=self.hidden_dims[0],
-                                kernel_size= 3, stride= 2, padding  = 1),
-                        nn.BatchNorm2d(self.hidden_dims[0]),
-                        nn.LeakyReLU())
-                )
-            for i in range(len(self.hidden_dims)-1):
-                classifier_module.append(
-                    nn.Sequential(
-                        nn.Conv2d(self.hidden_dims[i], out_channels=self.hidden_dims[i+1],
-                                kernel_size= 3, stride= 2, padding  = 1),
-                        nn.BatchNorm2d(self.hidden_dims[i+1]),
-                        nn.LeakyReLU())
-                )
-
-            self.concept_classifiers.append(nn.Sequential(*classifier_module))
-
-            self.concept_linears.append(
-                nn.Sequential(
-                    nn.Linear(self.hidden_dims[-1]*self.feature_map_size*self.feature_map_size, self.concept_dims[i]),
+        self.encoder_layer_wise_layer = nn.Sequential(
+                    nn.Linear(self.input_shape[1], num_concepts),
+                    nn.BatchNorm1d(num_concepts),
                     nn.LeakyReLU()
                 )
-            )
 
-        self.concept_classifiers = nn.ModuleList(self.concept_classifiers)
-        self.concept_linears = nn.ModuleList(self.concept_linears)
+        self.encoder_grouped_linear_layer = nn.ModuleList([
+            nn.Sequential(
+                    nn.Linear(self.input_shape[0], concept_dim),
+                    nn.BatchNorm1d(concept_dim),
+                    nn.LeakyReLU()
+                ) for concept_dim in self.concept_dims])
 
+        self.encoder_grouped_fc_mu = nn.ModuleList([        
+            nn.Sequential(
+                    nn.Linear(self.input_shape[0], 1),
+                    nn.LeakyReLU()
+                ) for _ in self.concept_dims])
+
+        self.encoder_grouped_fc_var = nn.ModuleList([
+            nn.Sequential(
+                    nn.Linear(self.input_shape[0], 1),
+                    nn.LeakyReLU()
+                ) for _ in self.concept_dims])
+
+        
 
         # Build Decoder
-        modules = []
+        self.decoder_grouped_linear_layer = nn.ModuleList([
+            nn.Sequential(
+                    nn.Linear(concept_dim+1,self.input_shape[0]),
+                    nn.BatchNorm1d(self.input_shape[0]),
+                    nn.LeakyReLU()
+                ) for concept_dim in self.concept_dims])
 
-        latent_dim = sum(self.concept_dims) + self.latent_dim
-        # latent_dim = self.latent_dim*self.concept_num
-        self.decoder_input = nn.Linear(latent_dim, self.hidden_dims[-1] *self.feature_map_size*self.feature_map_size)
+        self.decoder_layer_wise_layer = nn.Sequential(
+                    nn.Linear(num_concepts, self.input_shape[1]),
+                    nn.LeakyReLU(),
+                    nn.BatchNorm1d(self.input_shape[1]),
+                    nn.Linear(self.input_shape[1], self.input_shape[1]),
+                    nn.Tanh()
+                )
 
-        reversed_hidden_dims = self.hidden_dims[::-1]
-
-        for i in range(len(reversed_hidden_dims) - 1):
-            modules.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(reversed_hidden_dims[i],
-                                       reversed_hidden_dims[i + 1],
-                                       kernel_size=3,
-                                       stride = 2,
-                                       padding=1,
-                                       output_padding=1),
-                    nn.BatchNorm2d(reversed_hidden_dims[i + 1]),
-                    nn.LeakyReLU())
-            )
-
-
-
-        self.decoder = nn.Sequential(*modules)
-
-        self.final_layer = nn.Sequential(
-                            nn.ConvTranspose2d(reversed_hidden_dims[-1],
-                                               reversed_hidden_dims[-1],
-                                               kernel_size=3,
-                                               stride=2,
-                                               padding=1,
-                                               output_padding=1),
-                            nn.BatchNorm2d(reversed_hidden_dims[-1]),
-                            nn.LeakyReLU(),
-                            nn.Conv2d(reversed_hidden_dims[-1], out_channels= self.in_channels,
-                                      kernel_size= 3, padding= 1),
-                            nn.Tanh())
 
     def encode(self, input: Tensor) -> List[Tensor]:
         """
@@ -131,32 +81,43 @@ class CausalConceptVAE(nn.Module):
         :param input: (Tensor) Input tensor to encoder [N x C x H x W]
         :return: (Tensor) List of latent codes
         """
-        result = self.encoder(input)
-        result = torch.flatten(result, start_dim=1)
+        result = self.encoder_layer_wise_layer(input)
+        
+        concept_classes = []
+        mu = []
+        log_var = []
+        for i, concept_linear in enumerate(self.encoder_grouped_linear_layer):
+            concept_feature = result[:,:,i]
+            concept_latent = concept_linear(concept_feature)
+            one_mu = self.encoder_grouped_fc_mu[i](concept_feature)
+            one_log_var = self.encoder_grouped_fc_var[i](concept_feature)
+            concept_classes.append(concept_latent)
+            mu.append(one_mu)
+            log_var.append(one_log_var)
 
-        # Split the result into mu and var components
-        # of the latent Gaussian distribution
-        mu = self.fc_mu(result) 
-        log_var = self.fc_var(result) 
-
-        concept_features = [torch.flatten(fc(input), start_dim=1) for fc in self.concept_classifiers]
-        concept_classes = [fc(feature) for fc, feature in zip(self.concept_linears, concept_features)]
+        mu = torch.cat(mu, dim = -1) # [B x num_concept]
+        log_var = torch.cat(log_var, dim = -1) # [B x num_concept]
 
         return [mu, log_var, concept_classes]
 
-    def decode(self, z: Tensor, concept_classes: Tensor) -> Tensor:
+    def decode(self, z: Tensor, concept_classes: list) -> Tensor:
         """
         Maps the given latent codes
         onto the image space.
-        :param z: (Tensor) [B x D]
+        :param z: (Tensor) [B x num_concept]
+        :param concept_classes: (Tensor) [num_concept x B x concept_dim]
         :return: (Tensor) [B x C x H x W]
         """
-        c = torch.cat(concept_classes, dim = -1)
-        z = torch.cat([z, c], dim = -1)
-        result = self.decoder_input(z)
-        result = result.view(-1, self.hidden_dims[-1], self.feature_map_size, self.feature_map_size)
-        result = self.decoder(result)
-        result = self.final_layer(result)
+        concept_features = []
+        for index, decoder_linear in enumerate(self.decoder_grouped_linear_layer):
+            latent_input = torch.cat([concept_classes[index], z[:, index].unsqueeze(-1)], dim = -1) 
+            concept_feature = decoder_linear(latent_input)
+            concept_features.append(concept_feature)
+
+        concept_features = torch.stack(concept_features, dim = -1) # [B x num_concept x concept_dim]
+
+        result = self.decoder_layer_wise_layer(concept_features)
+
         return result
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
@@ -239,57 +200,6 @@ class CausalConceptVAE(nn.Module):
 
         return self.forward(x)[0]
 
-    def get_causal_adjacency_matrix(self, norm:str='mean'):
-        weights = []
-        
-        weights.append(self.decoder_input.weight)
-
-        for name, params in self.decoder.named_parameters():
-            if 'weight' in name:
-                print(params.shape)
-                weights.append(params)
-        for name, params in self.final_layer.named_parameters():
-            if 'weight' in name:
-                print(params.shape)
-                weights.append(params)
-
-        adjacency_matrix = torch.eye(sum(self.concept_dims))
-
-        for i in range(len(weights)-1):
-            if i == 0:
-                w1 = weights[i][:, self.latent_dim:].transpose(0,1)
-                w1 = w1.view(w1.shape[0], -1, self.feature_map_size, self.feature_map_size)
-                w1 = nn.AvgPool2d(w1.shape[-1])(w1)
-                w1 = torch.abs(w1).squeeze()
-
-            w2 =  weights[i+1]
-            if len(w2.shape) > 2:
-                w2 = nn.AvgPool2d(w2.shape[-1])(w2)
-                w2 = torch.abs(w2)
-            
-                if i != len(weights)-2:
-                    w2 = w2.squeeze()
-                else:
-                    w2 = w2.squeeze(dim=-1)
-                    w2 = w2.squeeze(dim=-1)
-                    w2 = w2.transpose(0,1)
-
-            if len(w1.shape) == len(w2.shape):
-                w1 = w1 @ w2
-            else:
-                w1 = w1 * w2
-
-        w1 = w1.squeeze()
-        w1 = nn.Softmax()(w1)
-        print(w1)
-
-    def h_loss(self, adjacency_matrix: Tensor):
-        return torch.trace(torch.matrix_exp(adjacency_matrix)) - adjacency_matrix.shape[0]
-
-    def aug_lagrangian_loss(self, adjacency_matrix: Tensor, h: Tensor):
-        # construction_loss + 0.5 * mu * h_loss ** 2 + lamb * h_loss + KL_loss
-        raise NotImplementedError
-
     def get_hyperparamters(self):
 
         return {
@@ -302,3 +212,90 @@ class CausalConceptVAE(nn.Module):
             'concept_dims': self.concept_dims,
             'classify_weight': self.classify_weight
         }
+
+# <---------------- Causal Structure Discovery ------------------------>
+
+    def get_causal_adjacency_matrix(self):
+
+        max_indices = torch.argmax(self.encoder_layer_wise_layer[0].weight, dim=0)
+
+
+        connectivity = self.decoder_layer_wise_layer[0].weight @ self.decoder_layer_wise_layer[3].weight
+
+        adjacency_matrix = connectivity[:, max_indices]
+
+        return adjacency_matrix
+
+    def h_loss(self, adjacency_matrix: Tensor):
+        return torch.trace(torch.matrix_exp(adjacency_matrix * adjacency_matrix)) - adjacency_matrix.shape[0]
+
+    def augemented_lagrangian_training(self):
+        # construction_loss + 0.5 * mu * h_loss ** 2 + lamb * h_loss + KL_loss
+        # initialize stuff for learning loop
+        aug_lagrangians = []
+        aug_lagrangian_ma = [0.0] * (self.num_train_iter + 1)
+        aug_lagrangians_val = []
+        grad_norms = []
+        grad_norm_ma = [0.0] * (self.num_train_iter + 1)
+
+        # Augmented Lagrangian stuff
+        mu = self.lagrangian_mu_init
+        lamb = self.lagrangian_lambda_init
+        mus = []
+        lambdas = []
+
+        optimizer = torch.optim.RMSprop(self.parameters(), lr=self.lr)
+
+        for epoch in range(self.num_train_iter):
+            self.train()
+
+            train_loss = 0
+            train_reconstruct_loss=0
+            train_kld_loss=0
+            train_distance = 0
+            train_classify_loss = 0
+            train_classify_acc_items = 0
+            train_concept_total_num = 0
+            train_acyclic_loss = 0
+
+            with tqdm(total=len(self.train_dataloader), postfix={'epoch': epoch}) as train_bar:
+                for batch_idx, (x, y) in enumerate(self.train_dataloader):
+                    x = x.to(self.device)
+                    concept_label = y.to(self.device)
+                    optimizer.zero_grad()
+                    output = self.forward(x)
+                    classify = [torch.argmax(nn.functional.softmax(o, dim=1),1) for o in output[4]]
+                    classify_results = torch.stack(classify, dim=0).transpose(0, 1)
+                    train_classify_acc_items += (classify_results == concept_label).sum().item()
+                    train_concept_total_num += np.prod(concept_label.shape)
+                    loss = self.loss_function(*output, concept_label, M_N=0.5, batch_idx=batch_idx)
+
+                    h_loss = self.h_loss(self.get_causal_adjacency_matrix())
+
+                    loss = loss['loss'] + 0.5 * mu * h_loss ** 2 + lamb * h_loss
+
+                    loss.backward()
+                    self.optimizer.step()
+                    train_loss += loss.item()
+                    train_reconstruct_loss += loss['Reconstruction_Loss'].item()
+                    train_kld_loss += loss['KLD'].item()
+                    train_acyclic_loss += h_loss
+                    train_distance += torch.mean(torch.abs(x - output[0])).item()
+                    train_classify_loss += loss['Classify_Loss'].item()
+                    train_bar.update(1)
+
+            self.scheduler.step()
+            train_loss /= self.train_dataloader.dataset.__len__()
+            train_reconstruct_loss /= self.train_dataloader.dataset.__len__()
+            train_kld_loss /= self.train_dataloader.dataset.__len__()
+            train_classify_loss /= self.train_dataloader.dataset.__len__()
+            train_distance /= -self.train_dataloader.dataset.__len__()
+            train_distance *= 255
+            train_bar.set_description(f'avg_train_loss: {train_loss}; avg_train_dist: {train_distance} epoch: {epoch}')
+
+
+
+
+
+        raise NotImplementedError
+
